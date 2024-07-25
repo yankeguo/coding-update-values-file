@@ -6,46 +6,55 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
-	"github.com/go-resty/resty/v2"
-	"github.com/yankeguo/rg"
 	"log"
 	"os"
+	"strconv"
+
+	"github.com/go-resty/resty/v2"
+	"github.com/yankeguo/rg"
 )
 
-type DescribeGitFileRequest struct {
-	DepotPath string `json:"DepotPath"`
-	Ref       string `json:"Ref"`
-	Path      string `json:"Path"`
+type HybridCodingResponse struct {
+	Response struct {
+		Error struct {
+			Message string `json:"Message"`
+			Code    string `json:"Code"`
+		}
+		GitFile struct {
+			Encoding string `json:"Encoding,omitempty"`
+			Content  string `json:"Content,omitempty"`
+		} `json:"GitFile"`
+		Commits []struct {
+			Sha string `json:"Sha"`
+		} `json:"Commits"`
+		GitCommit struct {
+			Sha string `json:"Sha"`
+		} `json:"GitCommit"`
+	} `json:"Response"`
 }
 
-type GitFile struct {
-	FileName      string `json:"FileName,omitempty"`
-	FilePath      string `json:"FilePath,omitempty"`
-	Size          int64  `json:"Size,omitempty"`
-	Encoding      string `json:"Encoding,omitempty"`
-	Content       string `json:"Content,omitempty"`
-	ContentSha256 string `json:"ContentSha256,omitempty"`
-	Sha           string `json:"Sha,omitempty"`
-}
+func invokeCodingAPI(ctx context.Context, client *resty.Client, action string, body map[string]any) (res HybridCodingResponse, err error) {
+	defer rg.Guard(&err)
 
-type DescribeGitFileResponse struct {
-	GitFile GitFile `json:"GitFile"`
-}
+	resp := rg.Must(client.R().
+		SetContext(ctx).
+		SetBody(body).SetResult(&res).
+		SetQueryParam("Action", action).
+		Post(action),
+	)
 
-type ModifyGitFile struct {
-	Path    string `json:"Path"`
-	Content string `json:"Content"`
-}
+	if resp.IsError() {
+		err = errors.New("coding api error: " + resp.String())
+		return
+	}
 
-type ModifyGitFilesRequest struct {
-	DepotPath     string          `json:"DepotPath,omitempty"`
-	GitFiles      []ModifyGitFile `json:"GitFiles,omitempty"`
-	LastCommitSha string          `json:"LastCommitSha,omitempty"`
-	Message       string          `json:"Message,omitempty"`
-	Ref           string          `json:"Ref,omitempty"`
-}
+	if res.Response.Error.Code != "" || res.Response.Error.Message != "" {
+		err = errors.New("coding api error: " + res.Response.Error.Code + ": " + res.Response.Error.Message)
+		return
+	}
 
-type ModifyGitFilesResponse struct{}
+	return
+}
 
 func main() {
 	var err error
@@ -75,81 +84,68 @@ func main() {
 
 	ctx := context.Background()
 
+	debug, _ := strconv.ParseBool(os.Getenv("CODING_DEBUG"))
+
 	client := resty.New().
 		SetBasicAuth(os.Getenv("CODING_USERNAME"), os.Getenv("CODING_PASSWORD")).
-		SetBaseURL("https://e.coding.net/open-api")
+		SetBaseURL("https://e.coding.net/open-api").
+		SetDebug(debug)
 
-	var file GitFile
+	resFile := rg.Must(invokeCodingAPI(ctx, client, "DescribeGitFile", map[string]any{
+		"DepotPath": optRepo,
+		"Path":      optFile,
+		"Ref":       optBranch,
+	}))
 
-	{
-		var res DescribeGitFileResponse
-
-		resp := rg.Must(client.R().
-			SetContext(ctx).
-			SetBody(&DescribeGitFileRequest{
-				DepotPath: optRepo,
-				Path:      optFile,
-				Ref:       optBranch,
-			}).SetResult(&res).
-			SetQueryParam("Action", "DescribeGitFile").
-			Post("DescribeGitFile"),
-		)
-
-		if resp.IsError() {
-			err = errors.New("failed describing git file: " + resp.String())
-			return
-		}
-
-		file = res.GitFile
-	}
-
-	log.Println("file fetched:", file.FilePath, file.Sha)
-
-	if file.Encoding != "base64" {
-		err = errors.New("unsupported encoding: " + file.Encoding)
+	if resFile.Response.GitFile.Encoding != "base64" {
+		err = errors.New("file not found or unsupported encoding")
 		return
 	}
 
-	buf := rg.Must(base64.StdEncoding.DecodeString(file.Content))
+	content := rg.Must(base64.StdEncoding.DecodeString(resFile.Response.GitFile.Content))
 
-	var m map[string]any
+	var values map[string]any
 
-	rg.Must0(json.Unmarshal(buf, &m))
+	rg.Must0(json.Unmarshal(content, &values))
 
-	if m[optKey] == optValue {
-		log.Println("key already set to value")
+	if values[optKey] == optValue {
+		log.Println("value not changed")
 		return
 	}
 
-	m[optKey] = optValue
+	values[optKey] = optValue
 
-	buf = rg.Must(json.MarshalIndent(m, "", "  "))
+	content = rg.Must(json.MarshalIndent(values, "", "  "))
 
-	{
-		var res ModifyGitFilesResponse
+	resCommits := rg.Must(invokeCodingAPI(ctx, client, "DescribeGitCommitInfos", map[string]any{
+		"DepotPath":  optRepo,
+		"Ref":        optBranch,
+		"PageNumber": 1,
+		"PageSize":   1,
+	}))
 
-		resp := rg.Must(client.R().
-			SetContext(ctx).
-			SetBody(&ModifyGitFilesRequest{
-				DepotPath:     optRepo,
-				Ref:           optBranch,
-				LastCommitSha: file.Sha,
-				Message:       "update " + file.FilePath,
-				GitFiles: []ModifyGitFile{
-					{
-						Path:    file.FilePath,
-						Content: string(buf),
-					},
-				},
-			}).
-			SetResult(&res).
-			SetQueryParam("Action", "ModifyGitFiles").
-			Post("ModifyGitFiles"),
-		)
-
-		if resp.IsError() {
-			err = errors.New("failed modifying git file: " + resp.String())
-			return
-		}
+	if len(resCommits.Response.Commits) == 0 {
+		err = errors.New("no commit found")
+		return
 	}
+
+	lastSha := resCommits.Response.Commits[0].Sha
+
+	resModify := rg.Must(invokeCodingAPI(ctx, client, "ModifyGitFiles", map[string]any{
+		"DepotPath":     optRepo,
+		"Ref":           optBranch,
+		"LastCommitSha": lastSha,
+		"Message":       "chore: update " + optFile,
+		"GitFiles": []map[string]any{{
+			"Path":    optFile,
+			"Content": string(content),
+		}},
+	}))
+
+	if resModify.Response.GitCommit.Sha == "" {
+		err = errors.New("failed modifying git file")
+		return
+	}
+
+	log.Println("updated file", optFile)
 }
